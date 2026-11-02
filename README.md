@@ -15,7 +15,7 @@ interpretations of regression test coverage. A draft is not a maintainer decisio
    change, and relevance of the identified commit. Keep "no longer reproduces"
    separate from a claim that the underlying defect is fixed.
 3. Record approval, edits, or rejection, with a reason. Retain the original draft
-   and identify the exact approved version by its SHA-256 hash.
+   and record which version was approved.
 4. After approval, post the reviewed comment to the original LLVM issue and
    record its URL here. LLVM maintainers decide whether to close or reopen it
    and whether additional regression tests are useful.
