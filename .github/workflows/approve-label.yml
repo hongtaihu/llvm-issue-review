@@ -10,8 +10,14 @@ on:
         required: true
         default: approved
         type: string
+      full_scan:
+        description: Rescan every issue instead of only issues updated since the last successful backfill
+        required: false
+        default: false
+        type: boolean
 
 permissions:
+  actions: read
   contents: read
   issues: write
 
@@ -25,40 +31,59 @@ jobs:
     runs-on: ubuntu-latest
     env:
       LABEL: ${{ inputs.label || vars.APPROVAL_LABEL || 'approved' }}
+      FULL_SCAN: ${{ inputs.full_scan || 'false' }}
     steps:
       - uses: actions/github-script@v7
         with:
           script: |
             const REQUIRED_APPROVALS = 2;
+            const SAFETY_OVERLAP_MS = 10 * 60 * 1000;
             const { owner, repo } = context.repo;
             const label = process.env.LABEL;
+            const forceFullScan =
+              String(process.env.FULL_SCAN).toLowerCase() === "true";
 
             if (!label) {
               core.setFailed("Label name is empty.");
               return;
             }
 
-            async function ensureLabelExists() {
+            function labelsOf(issue) {
+              return (issue.labels || []).map((item) =>
+                typeof item === "string" ? item : item.name
+              );
+            }
+
+            function hasLabel(issue, name) {
+              const wanted = name.toLowerCase();
+              return labelsOf(issue).some(
+                (item) => (item || "").toLowerCase() === wanted
+              );
+            }
+
+            async function labelExists(name) {
               try {
-                await github.rest.issues.getLabel({
+                await github.rest.issues.getLabel({ owner, repo, name });
+                return true;
+              } catch (error) {
+                if (error.status === 404) return false;
+                throw error;
+              }
+            }
+
+            async function ensureLabelExists() {
+              if (await labelExists(label)) return;
+
+              try {
+                await github.rest.issues.createLabel({
                   owner,
                   repo,
-                  name: label
+                  name: label,
+                  color: "0E8A16",
+                  description: "Approved by at least two reviewers"
                 });
-              } catch (error) {
-                if (error.status !== 404) throw error;
-
-                try {
-                  await github.rest.issues.createLabel({
-                    owner,
-                    repo,
-                    name: label,
-                    color: "0E8A16",
-                    description: "Approved by at least two reviewers"
-                  });
-                } catch (createError) {
-                  if (createError.status !== 422) throw createError;
-                }
+              } catch (createError) {
+                if (createError.status !== 422) throw createError;
               }
             }
 
@@ -93,16 +118,14 @@ jobs:
                 return false;
               }
 
-              const currentLabels = (issue.labels || []).map((item) =>
-                typeof item === "string" ? item : item.name
-              );
-
-              if (currentLabels.includes(label)) {
+              if (hasLabel(issue, label)) {
                 return false;
               }
 
               await ensureLabelExists();
 
+              // This is additive: category labels such as frontend, CSA,
+              // format, and tidy are preserved.
               await github.rest.issues.addLabels({
                 owner,
                 repo,
@@ -113,23 +136,109 @@ jobs:
               return true;
             }
 
-            // Manual run: scan every issue, including closed issues.
-            if (context.eventName === "workflow_dispatch") {
-              const issues = await github.paginate(
-                github.rest.issues.listForRepo,
+            async function getLastSuccessfulBackfillStart() {
+              const response = await github.paginate(
+                github.rest.actions.listWorkflowRuns,
                 {
                   owner,
                   repo,
-                  state: "all",
+                  workflow_id: "approve-label.yml",
+                  branch: "main",
+                  event: "workflow_dispatch",
+                  status: "success",
                   per_page: 100
                 }
               );
 
+              const runs = Array.isArray(response)
+                ? response
+                : response.workflow_runs || [];
+
+              for (const run of runs) {
+                if (
+                  run.event === "workflow_dispatch" &&
+                  run.conclusion === "success"
+                ) {
+                  return run.created_at;
+                }
+              }
+
+              return null;
+            }
+
+            // Manual run: backfill historical issues.
+            if (context.eventName === "workflow_dispatch") {
+              const targetLabelExists = await labelExists(label);
+
+              let lastSuccessfulStart = null;
+              if (targetLabelExists) {
+                try {
+                  lastSuccessfulStart =
+                    await getLastSuccessfulBackfillStart();
+                } catch (error) {
+                  core.warning(
+                    `Could not read previous backfill state; ` +
+                    `falling back to a full scan: ${error.message}`
+                  );
+                }
+              }
+
+              const cutoff = lastSuccessfulStart
+                ? new Date(
+                    new Date(lastSuccessfulStart).getTime() - SAFETY_OVERLAP_MS
+                  ).toISOString()
+                : null;
+
+              const scanAll = forceFullScan || !targetLabelExists || !cutoff;
+
+              const params = {
+                owner,
+                repo,
+                state: "all",
+                sort: "updated",
+                direction: "asc",
+                per_page: 100
+              };
+
+              if (!scanAll) {
+                params.since = cutoff;
+              }
+
+              const issues = await github.paginate(
+                github.rest.issues.listForRepo,
+                params
+              );
+
+              let candidates = 0;
+              let skippedLabeled = 0;
+              let skippedTooFewComments = 0;
+              let scanned = 0;
               let labeled = 0;
               let failed = 0;
 
+              core.info(
+                scanAll
+                  ? "Backfill mode: full scan."
+                  : `Backfill mode: incremental since ${cutoff}.`
+              );
+
               for (const issue of issues) {
                 if (issue.pull_request) continue;
+                candidates += 1;
+
+                // Already approved or already labeled: do not scan comments.
+                if (hasLabel(issue, label)) {
+                  skippedLabeled += 1;
+                  continue;
+                }
+
+                // Two distinct approvers require at least two comments.
+                if (Number(issue.comments || 0) < REQUIRED_APPROVALS) {
+                  skippedTooFewComments += 1;
+                  continue;
+                }
+
+                scanned += 1;
 
                 try {
                   const approvers = await getApprovers(issue.number);
@@ -148,8 +257,11 @@ jobs:
               }
 
               core.info(
-                `Backfill finished: ${labeled} issue(s) labeled, ` +
-                `${failed} failure(s).`
+                `Backfill finished: ${candidates} candidate issue(s), ` +
+                `${skippedLabeled} already labeled, ` +
+                `${skippedTooFewComments} with fewer than ` +
+                `${REQUIRED_APPROVALS} comments, ${scanned} scanned, ` +
+                `${labeled} labeled, ${failed} failure(s).`
               );
 
               if (failed > 0) {
@@ -166,6 +278,20 @@ jobs:
 
             if (!issue) {
               core.setFailed("No issue found in event payload.");
+              return;
+            }
+
+            if (hasLabel(issue, label)) {
+              core.info(
+                `#${issue.number}: "${label}" is already present; skipping.`
+              );
+              return;
+            }
+
+            if (Number(issue.comments || 0) < REQUIRED_APPROVALS) {
+              core.info(
+                `#${issue.number}: fewer than ${REQUIRED_APPROVALS} comments; skipping.`
+              );
               return;
             }
 
