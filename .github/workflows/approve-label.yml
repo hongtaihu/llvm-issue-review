@@ -137,7 +137,7 @@ jobs:
             }
 
             async function getLastSuccessfulBackfillStart() {
-              const runs = await github.paginate(
+              const response = await github.paginate(
                 github.rest.actions.listWorkflowRuns,
                 {
                   owner,
@@ -149,6 +149,10 @@ jobs:
                   per_page: 100
                 }
               );
+
+              const runs = Array.isArray(response)
+                ? response
+                : response.workflow_runs || [];
 
               for (const run of runs) {
                 if (
@@ -165,9 +169,19 @@ jobs:
             // Manual run: backfill historical issues.
             if (context.eventName === "workflow_dispatch") {
               const targetLabelExists = await labelExists(label);
-              const lastSuccessfulStart = targetLabelExists
-                ? await getLastSuccessfulBackfillStart()
-                : null;
+
+              let lastSuccessfulStart = null;
+              if (targetLabelExists) {
+                try {
+                  lastSuccessfulStart =
+                    await getLastSuccessfulBackfillStart();
+                } catch (error) {
+                  core.warning(
+                    `Could not read previous backfill state; ` +
+                    `falling back to a full scan: ${error.message}`
+                  );
+                }
+              }
 
               const cutoff = lastSuccessfulStart
                 ? new Date(
