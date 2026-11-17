@@ -1,0 +1,223 @@
+name: Sync category labels from LLVM upstream
+
+on:
+  issues:
+    types: [opened, edited, reopened]
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: Local issue number (leave empty to scan all issues)
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: sync-upstream-labels-${{ github.event.issue.number || 'backfill' }}
+  cancel-in-progress: false
+
+jobs:
+  sync-labels:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      UPSTREAM_TOKEN: ${{ secrets.LLVM_READ_TOKEN || secrets.UPSTREAM_GITHUB_TOKEN }}
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const UPSTREAM_REPO = "llvm/llvm-project";
+            const LABEL_MAP = {
+              "clang-format": "format",
+              "clang:frontend": "frontend",
+              "clang:static analyzer": "CSA",
+              "clang-tidy": "tidy",
+              "clang:diagnostics": "diagnostic"
+            };
+
+            const { owner, repo } = context.repo;
+            const upstreamToken = process.env.UPSTREAM_TOKEN;
+
+            if (!upstreamToken) {
+              core.setFailed(
+                "Missing LLVM_READ_TOKEN (or UPSTREAM_GITHUB_TOKEN). " +
+                "Cross-repository label sync needs a token that can read " +
+                `${UPSTREAM_REPO} issues.`
+              );
+              return;
+            }
+
+            function labelsOf(issue) {
+              return (issue.labels || [])
+                .map((item) => (typeof item === "string" ? item : item.name))
+                .filter(Boolean);
+            }
+
+            function getUpstreamIssueNumber(body) {
+              const match = (body || "").match(
+                /https?:\/\/github\.com\/llvm\/llvm-project\/issues\/(\d+)/i
+              );
+              return match ? Number(match[1]) : null;
+            }
+
+            async function fetchUpstreamIssue(issueNumber) {
+              const response = await fetch(
+                `https://api.github.com/repos/${UPSTREAM_REPO}/issues/${issueNumber}`,
+                {
+                  headers: {
+                    Authorization: `Bearer ${upstreamToken}`,
+                    Accept: "application/vnd.github+json",
+                    "X-GitHub-Api-Version": "2022-11-28",
+                    "User-Agent": "llvm-issue-review-label-sync"
+                  }
+                }
+              );
+
+              if (!response.ok) {
+                const detail = (await response.text()).slice(0, 300);
+                throw new Error(
+                  `Upstream issue #${issueNumber}: ` +
+                  `HTTP ${response.status} ${detail}`
+                );
+              }
+
+              return response.json();
+            }
+
+            function getMappedLabels(upstreamIssue) {
+              const targets = new Set();
+
+              for (const item of upstreamIssue.labels || []) {
+                const name = (typeof item === "string" ? item : item.name)
+                  ?.trim()
+                  .toLowerCase();
+                if (!name) continue;
+
+                const local = LABEL_MAP[name];
+                if (local) targets.add(local);
+              }
+
+              return [...targets];
+            }
+
+            async function syncIssue(issue) {
+              const upstreamNumber = getUpstreamIssueNumber(issue.body);
+
+              if (!upstreamNumber) {
+                core.info(`#${issue.number}: no LLVM issue URL; skipping.`);
+                return { added: 0 };
+              }
+
+              const upstreamIssue = await fetchUpstreamIssue(upstreamNumber);
+              const wanted = getMappedLabels(upstreamIssue);
+
+              if (wanted.length === 0) {
+                core.info(
+                  `#${issue.number}: upstream #${upstreamNumber} has no mapped labels.`
+                );
+                return { added: 0 };
+              }
+
+              const current = new Set(
+                labelsOf(issue).map((name) => name.toLowerCase())
+              );
+              const missing = wanted.filter(
+                (name) => !current.has(name.toLowerCase())
+              );
+
+              if (missing.length === 0) {
+                core.info(
+                  `#${issue.number}: already has ${wanted.join(", ")}.`
+                );
+                return { added: 0 };
+              }
+
+              await github.rest.issues.addLabels({
+                owner,
+                repo,
+                issue_number: issue.number,
+                labels: missing
+              });
+
+              core.info(
+                `#${issue.number}: upstream #${upstreamNumber} -> ` +
+                `added ${missing.join(", ")}.`
+              );
+
+              return { added: missing.length };
+            }
+
+            if (context.eventName === "workflow_dispatch") {
+              const rawIssueNumber = (
+                context.payload.inputs?.issue_number || ""
+              ).trim();
+
+              if (rawIssueNumber) {
+                const issueNumber = Number(rawIssueNumber);
+
+                if (!Number.isInteger(issueNumber) || issueNumber <= 0) {
+                  core.setFailed(`Invalid issue number: ${rawIssueNumber}`);
+                  return;
+                }
+
+                const { data: issue } = await github.rest.issues.get({
+                  owner,
+                  repo,
+                  issue_number: issueNumber
+                });
+
+                await syncIssue(issue);
+                return;
+              }
+
+              const issues = await github.paginate(
+                github.rest.issues.listForRepo,
+                {
+                  owner,
+                  repo,
+                  state: "all",
+                  per_page: 100
+                }
+              );
+
+              let processed = 0;
+              let added = 0;
+              let failed = 0;
+
+              for (const issue of issues) {
+                if (issue.pull_request) continue;
+                processed += 1;
+
+                try {
+                  const result = await syncIssue(issue);
+                  added += result.added;
+                } catch (error) {
+                  failed += 1;
+                  core.warning(`#${issue.number}: ${error.message}`);
+                }
+              }
+
+              core.info(
+                `Label sync finished: ${processed} issue(s) processed, ` +
+                `${added} label(s) added, ${failed} failure(s).`
+              );
+
+              if (failed > 0) {
+                core.setFailed(
+                  `${failed} issue(s) failed. Re-run after fixing the errors.`
+                );
+              }
+
+              return;
+            }
+
+            const issue = context.payload.issue;
+
+            if (!issue) {
+              core.setFailed("No issue found in event payload.");
+              return;
+            }
+
+            await syncIssue(issue);
