@@ -1,0 +1,184 @@
+name: Label issues with two approvals
+
+on:
+  issue_comment:
+    types: [created, edited]
+  workflow_dispatch:
+    inputs:
+      label:
+        description: Label name to add
+        required: true
+        default: approved
+        type: string
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: approve-label-${{ github.event.issue.number || 'backfill' }}
+  cancel-in-progress: false
+
+jobs:
+  approve-label:
+    if: github.event_name == 'workflow_dispatch' || !github.event.issue.pull_request
+    runs-on: ubuntu-latest
+    env:
+      LABEL: ${{ inputs.label || vars.APPROVAL_LABEL || 'approved' }}
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const REQUIRED_APPROVALS = 2;
+            const { owner, repo } = context.repo;
+            const label = process.env.LABEL;
+
+            if (!label) {
+              core.setFailed("Label name is empty.");
+              return;
+            }
+
+            async function ensureLabelExists() {
+              try {
+                await github.rest.issues.getLabel({
+                  owner,
+                  repo,
+                  name: label
+                });
+              } catch (error) {
+                if (error.status !== 404) throw error;
+
+                try {
+                  await github.rest.issues.createLabel({
+                    owner,
+                    repo,
+                    name: label,
+                    color: "0E8A16",
+                    description: "Approved by at least two reviewers"
+                  });
+                } catch (createError) {
+                  if (createError.status !== 422) throw createError;
+                }
+              }
+            }
+
+            async function getApprovers(issueNumber) {
+              const comments = await github.paginate(
+                github.rest.issues.listComments,
+                {
+                  owner,
+                  repo,
+                  issue_number: issueNumber,
+                  per_page: 100
+                }
+              );
+
+              const approvers = new Set();
+
+              for (const comment of comments) {
+                const login = comment.user?.login?.toLowerCase() || "";
+                if (!login || comment.user?.type === "Bot") continue;
+
+                const body = (comment.body || "").trim().toLowerCase();
+                if (body === "approve" || body === "approved") {
+                  approvers.add(login);
+                }
+              }
+
+              return approvers;
+            }
+
+            async function addLabelIfNeeded(issue, approvers) {
+              if (approvers.size < REQUIRED_APPROVALS) {
+                return false;
+              }
+
+              const currentLabels = (issue.labels || []).map((item) =>
+                typeof item === "string" ? item : item.name
+              );
+
+              if (currentLabels.includes(label)) {
+                return false;
+              }
+
+              await ensureLabelExists();
+
+              await github.rest.issues.addLabels({
+                owner,
+                repo,
+                issue_number: issue.number,
+                labels: [label]
+              });
+
+              return true;
+            }
+
+            // Manual run: scan every issue, including closed issues.
+            if (context.eventName === "workflow_dispatch") {
+              const issues = await github.paginate(
+                github.rest.issues.listForRepo,
+                {
+                  owner,
+                  repo,
+                  state: "all",
+                  per_page: 100
+                }
+              );
+
+              let labeled = 0;
+              let failed = 0;
+
+              for (const issue of issues) {
+                if (issue.pull_request) continue;
+
+                try {
+                  const approvers = await getApprovers(issue.number);
+
+                  if (await addLabelIfNeeded(issue, approvers)) {
+                    labeled += 1;
+                    core.info(
+                      `#${issue.number}: added "${label}" ` +
+                      `(${[...approvers].join(", ")}).`
+                    );
+                  }
+                } catch (error) {
+                  failed += 1;
+                  core.warning(`#${issue.number}: ${error.message}`);
+                }
+              }
+
+              core.info(
+                `Backfill finished: ${labeled} issue(s) labeled, ` +
+                `${failed} failure(s).`
+              );
+
+              if (failed > 0) {
+                core.setFailed(
+                  `${failed} issue(s) failed. Re-run the backfill after fixing the errors.`
+                );
+              }
+
+              return;
+            }
+
+            // issue_comment: check only the issue that received the comment.
+            const issue = context.payload.issue;
+
+            if (!issue) {
+              core.setFailed("No issue found in event payload.");
+              return;
+            }
+
+            const approvers = await getApprovers(issue.number);
+
+            core.info(
+              `#${issue.number}: ${approvers.size} distinct approver(s) ` +
+              `(${[...approvers].join(", ") || "none"}); ` +
+              `need ${REQUIRED_APPROVALS}.`
+            );
+
+            if (await addLabelIfNeeded(issue, approvers)) {
+              core.info(`#${issue.number}: added "${label}".`);
+            } else if (approvers.size >= REQUIRED_APPROVALS) {
+              core.info(`#${issue.number}: "${label}" is already present.`);
+            }
