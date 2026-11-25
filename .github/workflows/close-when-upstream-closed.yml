@@ -85,16 +85,6 @@ jobs:
               return response.json();
             }
 
-            function localStateReason(upstream) {
-              if (
-                upstream.state_reason === "not_planned" ||
-                upstream.state_reason === "duplicate"
-              ) {
-                return "not_planned";
-              }
-              return "completed";
-            }
-
             async function hasCloseComment(issueNumber) {
               const comments = await github.paginate(
                 github.rest.issues.listComments,
@@ -120,13 +110,11 @@ jobs:
 
               if (upstream.state !== "closed") return { result: "upstream-open" };
 
-              const reason = localStateReason(upstream);
               const url = `https://github.com/${UPSTREAM_REPO}/issues/${upstreamNumber}`;
 
               if (dryRun) {
                 core.info(
-                  `#${issue.number}: would close (upstream #${upstreamNumber}, ` +
-                  `${upstream.state_reason || "completed"}, ` +
+                  `#${issue.number}: would close (upstream #${upstreamNumber} ` +
                   `closed at ${upstream.closed_at || "unknown"}).`
                 );
                 return { result: "would-close" };
@@ -141,7 +129,6 @@ jobs:
                     `${CLOSE_MARKER}\n` +
                     `Closing this review item because the tracked upstream issue is closed.\n\n` +
                     `- Upstream: ${url}\n` +
-                    `- Upstream state: closed (${upstream.state_reason || "completed"})\n` +
                     `- Upstream closed at: ${upstream.closed_at || "unknown"}\n\n` +
                     `Reopen this issue if the review still needs to happen.`
                 });
@@ -152,11 +139,11 @@ jobs:
                 repo,
                 issue_number: issue.number,
                 state: "closed",
-                state_reason: reason
+                state_reason: "completed"
               });
 
               core.info(
-                `#${issue.number}: closed (upstream #${upstreamNumber}, ${reason}).`
+                `#${issue.number}: closed (upstream #${upstreamNumber}).`
               );
               return { result: "closed" };
             }
