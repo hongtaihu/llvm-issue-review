@@ -1,0 +1,240 @@
+name: Close local issues when the LLVM issue closes
+
+on:
+  schedule:
+    - cron: "37 3 * * *"
+  issues:
+    types: [opened, edited]
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: Local issue number (leave empty to scan every open issue)
+        required: false
+        type: string
+      dry_run:
+        description: Report what would be closed without changing any issue
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: close-on-upstream-close-${{ github.event.issue.number || 'scan' }}
+  cancel-in-progress: false
+
+jobs:
+  close-issues:
+    if: github.event_name != 'issues' || !github.event.issue.pull_request
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      UPSTREAM_TOKEN: ${{ secrets.LLVM_READ_TOKEN || secrets.LLVM_READ_SECRET || secrets.UPSTREAM_GITHUB_TOKEN }}
+      DRY_RUN: ${{ inputs.dry_run || 'false' }}
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          retries: 3
+          script: |
+            const UPSTREAM_REPO = "llvm/llvm-project";
+            const CLOSE_MARKER = "<!-- close-on-upstream-close -->";
+            const { owner, repo } = context.repo;
+            const upstreamToken = process.env.UPSTREAM_TOKEN;
+            const dryRun = String(process.env.DRY_RUN).toLowerCase() === "true";
+
+            if (!upstreamToken) {
+              core.setFailed(
+                "Missing LLVM_READ_TOKEN, LLVM_READ_SECRET, or " +
+                "UPSTREAM_GITHUB_TOKEN. Checking upstream issue state needs " +
+                `a token that can read ${UPSTREAM_REPO} issues.`
+              );
+              return;
+            }
+
+            function getUpstreamNumber(body) {
+              const match = (body || "").match(
+                /https?:\/\/github\.com\/llvm\/llvm-project\/issues\/(\d+)/i
+              );
+              return match ? Number(match[1]) : null;
+            }
+
+            async function fetchUpstreamIssue(issueNumber) {
+              const response = await fetch(
+                `https://api.github.com/repos/${UPSTREAM_REPO}/issues/${issueNumber}`,
+                {
+                  headers: {
+                    Authorization: `Bearer ${upstreamToken}`,
+                    Accept: "application/vnd.github+json",
+                    "X-GitHub-Api-Version": "2022-11-28",
+                    "User-Agent": "llvm-issue-review-close-sync"
+                  }
+                }
+              );
+
+              if (response.status === 404) return null;
+
+              if (!response.ok) {
+                const detail = (await response.text()).slice(0, 300);
+                throw new Error(
+                  `Upstream #${issueNumber}: HTTP ${response.status} ${detail}`
+                );
+              }
+
+              return response.json();
+            }
+
+            function localStateReason(upstream) {
+              if (
+                upstream.state_reason === "not_planned" ||
+                upstream.state_reason === "duplicate"
+              ) {
+                return "not_planned";
+              }
+              return "completed";
+            }
+
+            async function hasCloseComment(issueNumber) {
+              const comments = await github.paginate(
+                github.rest.issues.listComments,
+                { owner, repo, issue_number: issueNumber, per_page: 100 }
+              );
+
+              return comments.some((comment) =>
+                (comment.body || "").includes(CLOSE_MARKER)
+              );
+            }
+
+            async function closeIfUpstreamClosed(issue) {
+              const upstreamNumber = getUpstreamNumber(issue.body);
+              if (!upstreamNumber) return { result: "no-link" };
+
+              const upstream = await fetchUpstreamIssue(upstreamNumber);
+              if (!upstream || upstream.pull_request) {
+                core.warning(
+                  `#${issue.number}: upstream #${upstreamNumber} is unavailable; skipping.`
+                );
+                return { result: "missing" };
+              }
+
+              if (upstream.state !== "closed") return { result: "upstream-open" };
+
+              const reason = localStateReason(upstream);
+              const url = `https://github.com/${UPSTREAM_REPO}/issues/${upstreamNumber}`;
+
+              if (dryRun) {
+                core.info(
+                  `#${issue.number}: would close (upstream #${upstreamNumber}, ` +
+                  `${upstream.state_reason || "completed"}, ` +
+                  `closed at ${upstream.closed_at || "unknown"}).`
+                );
+                return { result: "would-close" };
+              }
+
+              if (!(await hasCloseComment(issue.number))) {
+                await github.rest.issues.createComment({
+                  owner,
+                  repo,
+                  issue_number: issue.number,
+                  body:
+                    `${CLOSE_MARKER}\n` +
+                    `Closing this review item because the tracked upstream issue is closed.\n\n` +
+                    `- Upstream: ${url}\n` +
+                    `- Upstream state: closed (${upstream.state_reason || "completed"})\n` +
+                    `- Upstream closed at: ${upstream.closed_at || "unknown"}\n\n` +
+                    `Reopen this issue if the review still needs to happen.`
+                });
+              }
+
+              await github.rest.issues.update({
+                owner,
+                repo,
+                issue_number: issue.number,
+                state: "closed",
+                state_reason: reason
+              });
+
+              core.info(
+                `#${issue.number}: closed (upstream #${upstreamNumber}, ${reason}).`
+              );
+              return { result: "closed" };
+            }
+
+            const counters = {
+              checked: 0,
+              closed: 0,
+              "would-close": 0,
+              "upstream-open": 0,
+              "no-link": 0,
+              missing: 0,
+              failed: 0
+            };
+
+            async function check(issue) {
+              counters.checked += 1;
+
+              try {
+                const { result } = await closeIfUpstreamClosed(issue);
+                counters[result] = (counters[result] || 0) + 1;
+              } catch (error) {
+                counters.failed += 1;
+                core.warning(`#${issue.number}: ${error.message}`);
+              }
+            }
+
+            const rawIssueNumber = (
+              context.payload.inputs?.issue_number || ""
+            ).trim();
+
+            if (context.eventName === "workflow_dispatch" && rawIssueNumber) {
+              const issueNumber = Number(rawIssueNumber);
+
+              if (!Number.isInteger(issueNumber) || issueNumber <= 0) {
+                core.setFailed(`Invalid issue number: ${rawIssueNumber}`);
+                return;
+              }
+
+              const { data: issue } = await github.rest.issues.get({
+                owner,
+                repo,
+                issue_number: issueNumber
+              });
+
+              await check(issue);
+            } else if (context.eventName === "issues") {
+              const issue = context.payload.issue;
+
+              if (!issue) {
+                core.setFailed("No issue found in event payload.");
+                return;
+              }
+
+              if (issue.state === "open") await check(issue);
+            } else {
+              const issues = await github.paginate(
+                github.rest.issues.listForRepo,
+                { owner, repo, state: "open", per_page: 100 }
+              );
+
+              for (const issue of issues) {
+                if (issue.pull_request) continue;
+                await check(issue);
+              }
+            }
+
+            core.info(
+              `Upstream close sync: ${counters.checked} checked, ` +
+              `${counters.closed} closed, ` +
+              `${counters["would-close"]} would close, ` +
+              `${counters["upstream-open"]} still open upstream, ` +
+              `${counters["no-link"]} without an upstream link, ` +
+              `${counters.missing} unavailable upstream, ` +
+              `${counters.failed} failure(s).`
+            );
+
+            if (counters.failed > 0) {
+              core.setFailed(
+                `${counters.failed} issue(s) failed. Re-run after fixing the errors.`
+              );
+            }
