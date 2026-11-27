@@ -61,8 +61,8 @@ jobs:
                 await github.rest.issues.updateLabel({
                   owner,
                   repo,
-                  current_name: oldName,
-                  name: newName,
+                  name: oldName,
+                  new_name: newName,
                   description: DESCRIPTIONS[newName]
                 });
                 core.info(`${oldName} -> ${newName}.`);
