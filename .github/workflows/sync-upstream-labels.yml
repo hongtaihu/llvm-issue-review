@@ -1,6 +1,8 @@
 name: Sync category labels from LLVM upstream
 
 on:
+  schedule:
+    - cron: "41 3 * * *"
   issues:
     types: [opened, edited, reopened]
   workflow_dispatch:
@@ -27,14 +29,38 @@ jobs:
     steps:
       - uses: actions/github-script@v7
         with:
+          retries: 3
           script: |
             const UPSTREAM_REPO = "llvm/llvm-project";
             const LABEL_MAP = {
-              "clang-format": "format",
-              "clang:frontend": "frontend",
-              "clang:static analyzer": "CSA",
-              "clang-tidy": "tidy",
-              "clang:diagnostics": "diagnostic"
+              "clang-format": "upstream/format",
+              "clang:frontend": "upstream/frontend",
+              "clang:static analyzer": "upstream/CSA",
+              "clang-tidy": "upstream/tidy",
+              "clang:diagnostics": "upstream/diagnostic"
+            };
+
+            const LABEL_META = {
+              "upstream/format": {
+                color: "5319e7",
+                description: "Upstream label clang-format"
+              },
+              "upstream/frontend": {
+                color: "b3d42e",
+                description: "Upstream label clang:frontend"
+              },
+              "upstream/CSA": {
+                color: "0052cc",
+                description: "Upstream label clang:static analyzer"
+              },
+              "upstream/tidy": {
+                color: "006b75",
+                description: "Upstream label clang-tidy"
+              },
+              "upstream/diagnostic": {
+                color: "d93f0b",
+                description: "Upstream label clang:diagnostics"
+              }
             };
 
             const { owner, repo } = context.repo;
@@ -102,6 +128,34 @@ jobs:
               return [...targets];
             }
 
+            const ensuredLabels = new Set();
+
+            async function ensureLabel(name) {
+              if (ensuredLabels.has(name)) return;
+
+              try {
+                await github.rest.issues.getLabel({ owner, repo, name });
+              } catch (error) {
+                if (error.status !== 404) throw error;
+
+                const meta = LABEL_META[name] || {};
+
+                try {
+                  await github.rest.issues.createLabel({
+                    owner,
+                    repo,
+                    name,
+                    color: meta.color || "ededed",
+                    description: meta.description || ""
+                  });
+                } catch (createError) {
+                  if (createError.status !== 422) throw createError;
+                }
+              }
+
+              ensuredLabels.add(name);
+            }
+
             async function syncIssue(issue) {
               const upstreamNumber = getUpstreamIssueNumber(issue.body);
 
@@ -133,6 +187,8 @@ jobs:
                 );
                 return { added: 0 };
               }
+
+              for (const name of missing) await ensureLabel(name);
 
               await github.rest.issues.addLabels({
                 owner,
