@@ -1,0 +1,382 @@
+name: Label issues commented on upstream
+
+on:
+  schedule:
+    - cron: "23 4 * * *"
+  issues:
+    types: [opened, edited]
+  workflow_dispatch:
+    inputs:
+      label:
+        description: Label name to add
+        required: true
+        default: commented
+        type: string
+      issue_number:
+        description: Local issue number (leave empty to scan every issue)
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: commented-label-${{ github.event.issue.number || 'backfill' }}
+  cancel-in-progress: false
+
+jobs:
+  commented-label:
+    if: github.event_name != 'issues' || !github.event.issue.pull_request
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      LABEL: ${{ inputs.label || vars.COMMENTED_LABEL || 'commented' }}
+      UPSTREAM_TOKEN: ${{ secrets.LLVM_READ_TOKEN || secrets.LLVM_READ_SECRET || secrets.UPSTREAM_GITHUB_TOKEN }}
+      COMMENT_AUTHOR: ${{ vars.UPSTREAM_COMMENT_AUTHOR || github.repository_owner }}
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          retries: 3
+          script: |
+            const UPSTREAM_REPO = "llvm/llvm-project";
+            const API = "https://api.github.com";
+            const SEARCH = `${API}/search/issues`;
+            const SEARCH_CAP = 1000;
+            const { owner, repo } = context.repo;
+            const label = process.env.LABEL;
+            const author = (process.env.COMMENT_AUTHOR || "").trim().toLowerCase();
+            const upstreamToken = process.env.UPSTREAM_TOKEN;
+
+            if (!label) {
+              core.setFailed("Label name is empty.");
+              return;
+            }
+
+            if (!author) {
+              core.setFailed("Comment author is empty.");
+              return;
+            }
+
+            if (!upstreamToken) {
+              core.setFailed(
+                "Missing LLVM_READ_TOKEN, LLVM_READ_SECRET, or " +
+                "UPSTREAM_GITHUB_TOKEN. Checking upstream comments needs " +
+                `a token that can read ${UPSTREAM_REPO} issues.`
+              );
+              return;
+            }
+
+            const headers = {
+              Authorization: `Bearer ${upstreamToken}`,
+              Accept: "application/vnd.github+json",
+              "X-GitHub-Api-Version": "2022-11-28",
+              "User-Agent": "llvm-issue-review-commented-label"
+            };
+
+            async function fetchJson(url, attempts = 3) {
+              for (let attempt = 1; ; attempt++) {
+                const response = await fetch(url, { headers });
+
+                if (response.status === 404) return { data: null };
+
+                if (response.ok) return { data: await response.json() };
+
+                const detail = (await response.text()).slice(0, 300);
+                const retryable =
+                  response.status >= 500 || response.status === 429;
+
+                if (retryable && attempt < attempts) {
+                  await new Promise((resolve) =>
+                    setTimeout(resolve, 2000 * attempt)
+                  );
+                  continue;
+                }
+
+                throw new Error(`HTTP ${response.status} ${detail}`);
+              }
+            }
+
+            function labelsOf(issue) {
+              return (issue.labels || []).map((item) =>
+                typeof item === "string" ? item : item.name
+              );
+            }
+
+            function hasLabel(issue, name) {
+              const wanted = name.toLowerCase();
+              return labelsOf(issue).some(
+                (item) => (item || "").toLowerCase() === wanted
+              );
+            }
+
+            let labelReady = false;
+
+            async function ensureLabelReady() {
+              if (labelReady) return;
+
+              try {
+                await github.rest.issues.getLabel({ owner, repo, name: label });
+                labelReady = true;
+                return;
+              } catch (error) {
+                if (error.status !== 404) throw error;
+              }
+
+              try {
+                await github.rest.issues.createLabel({
+                  owner,
+                  repo,
+                  name: label,
+                  color: "1D76DB",
+                  description: "Reviewer commented on the upstream LLVM issue"
+                });
+              } catch (createError) {
+                if (createError.status !== 422) throw createError;
+              }
+
+              labelReady = true;
+            }
+
+            function getUpstreamNumber(body) {
+              const match = (body || "").match(
+                /https?:\/\/github\.com\/llvm\/llvm-project\/issues\/(\d+)/i
+              );
+              return match ? Number(match[1]) : null;
+            }
+
+            // Single issue: read its upstream comments directly.
+            async function authorCommented(upstreamNumber) {
+              const { data: upstream } = await fetchJson(
+                `${API}/repos/${UPSTREAM_REPO}/issues/${upstreamNumber}`
+              );
+
+              if (!upstream || upstream.pull_request) return false;
+
+              const total = Number(upstream.comments || 0);
+              if (total === 0) return false;
+
+              const pages = Math.ceil(total / 100);
+
+              for (let page = 1; page <= pages; page++) {
+                const { data: comments } = await fetchJson(
+                  `${API}/repos/${UPSTREAM_REPO}/issues/${upstreamNumber}` +
+                  `/comments?per_page=100&page=${page}`
+                );
+
+                if (!Array.isArray(comments) || comments.length === 0) break;
+
+                if (
+                  comments.some(
+                    (comment) =>
+                      (comment.user?.login || "").toLowerCase() === author
+                  )
+                ) {
+                  return true;
+                }
+              }
+
+              return false;
+            }
+
+            async function searchCount(query) {
+              const { data } = await fetchJson(
+                `${SEARCH}?q=${encodeURIComponent(query)}&per_page=1`
+              );
+              return Number(data?.total_count || 0);
+            }
+
+            async function searchNumbers(query, limit = SEARCH_CAP) {
+              const numbers = new Set();
+              const pages = Math.ceil(limit / 100);
+
+              for (let page = 1; page <= pages; page++) {
+                const { data } = await fetchJson(
+                  `${SEARCH}?q=${encodeURIComponent(query)}` +
+                  `&per_page=100&page=${page}`
+                );
+                const items = data?.items || [];
+
+                for (const item of items) numbers.add(Number(item.number));
+
+                if (items.length < 100) break;
+              }
+
+              return numbers;
+            }
+
+            // Full scan: one search for every upstream issue the reviewer
+            // commented on, instead of paging through each issue's comments.
+            async function collectCommentedNumbers() {
+              const base = `repo:${UPSTREAM_REPO} is:issue commenter:${author}`;
+              const total = await searchCount(base);
+
+              core.info(
+                `Upstream search: ${total} issue(s) commented by ${author}.`
+              );
+
+              if (total <= SEARCH_CAP) return searchNumbers(base);
+
+              // GitHub search returns at most 1000 results per query.
+              const numbers = new Set();
+              const nowYear = new Date().getUTCFullYear();
+              const windows = ["created:<2019-01-01"];
+
+              for (let year = 2019; year <= nowYear; year++) {
+                windows.push(`created:${year}-01-01..${year}-12-31`);
+              }
+
+              for (const window of windows) {
+                const query = `${base} ${window}`;
+                const count = await searchCount(query);
+                if (count === 0) continue;
+
+                if (count > SEARCH_CAP) {
+                  core.warning(
+                    `${window}: ${count} results exceed the search cap ` +
+                    `of ${SEARCH_CAP}; some issues may be missed.`
+                  );
+                }
+
+                for (const number of await searchNumbers(query)) {
+                  numbers.add(number);
+                }
+              }
+
+              return numbers;
+            }
+
+            const counters = {
+              checked: 0,
+              added: 0,
+              labeled: 0,
+              "not-commented": 0,
+              "no-link": 0,
+              failed: 0
+            };
+
+            async function addLabel(issue) {
+              await ensureLabelReady();
+              await github.rest.issues.addLabels({
+                owner,
+                repo,
+                issue_number: issue.number,
+                labels: [label]
+              });
+            }
+
+            async function handleIssue(issue) {
+              counters.checked += 1;
+
+              if (hasLabel(issue, label)) {
+                counters.labeled += 1;
+                return;
+              }
+
+              const upstreamNumber = getUpstreamNumber(issue.body);
+              if (!upstreamNumber) {
+                counters["no-link"] += 1;
+                return;
+              }
+
+              try {
+                if (!(await authorCommented(upstreamNumber))) {
+                  counters["not-commented"] += 1;
+                  return;
+                }
+
+                await addLabel(issue);
+                counters.added += 1;
+                core.info(
+                  `#${issue.number}: ${author} commented on ` +
+                  `upstream #${upstreamNumber}; added "${label}".`
+                );
+              } catch (error) {
+                counters.failed += 1;
+                core.warning(`#${issue.number}: ${error.message}`);
+              }
+            }
+
+            const rawIssueNumber = (
+              context.payload.inputs?.issue_number || ""
+            ).trim();
+
+            if (context.eventName === "workflow_dispatch" && rawIssueNumber) {
+              const issueNumber = Number(rawIssueNumber);
+
+              if (!Number.isInteger(issueNumber) || issueNumber <= 0) {
+                core.setFailed(`Invalid issue number: ${rawIssueNumber}`);
+                return;
+              }
+
+              const { data: issue } = await github.rest.issues.get({
+                owner,
+                repo,
+                issue_number: issueNumber
+              });
+
+              await handleIssue(issue);
+            } else if (context.eventName === "issues") {
+              const issue = context.payload.issue;
+
+              if (!issue) {
+                core.setFailed("No issue found in event payload.");
+                return;
+              }
+
+              await handleIssue(issue);
+            } else {
+              const commentedNumbers = await collectCommentedNumbers();
+              const issues = await github.paginate(
+                github.rest.issues.listForRepo,
+                { owner, repo, state: "all", per_page: 100 }
+              );
+
+              for (const issue of issues) {
+                if (issue.pull_request) continue;
+                counters.checked += 1;
+
+                if (hasLabel(issue, label)) {
+                  counters.labeled += 1;
+                  continue;
+                }
+
+                const upstreamNumber = getUpstreamNumber(issue.body);
+                if (!upstreamNumber) {
+                  counters["no-link"] += 1;
+                  continue;
+                }
+
+                if (!commentedNumbers.has(upstreamNumber)) {
+                  counters["not-commented"] += 1;
+                  continue;
+                }
+
+                try {
+                  await addLabel(issue);
+                  counters.added += 1;
+                  core.info(
+                    `#${issue.number}: ${author} commented on ` +
+                    `upstream #${upstreamNumber}; added "${label}".`
+                  );
+                } catch (error) {
+                  counters.failed += 1;
+                  core.warning(`#${issue.number}: ${error.message}`);
+                }
+              }
+            }
+
+            core.info(
+              `Commented label sync: ${counters.checked} checked, ` +
+              `${counters.added} labeled, ` +
+              `${counters.labeled} already labeled, ` +
+              `${counters["not-commented"]} without an upstream comment, ` +
+              `${counters["no-link"]} without an upstream link, ` +
+              `${counters.failed} failure(s).`
+            );
+
+            if (counters.failed > 0) {
+              core.setFailed(
+                `${counters.failed} issue(s) failed. Re-run after fixing the errors.`
+              );
+            }
