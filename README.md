@@ -24,6 +24,21 @@ We avoid direct user and team mentions in review issues. Links may appear as
 cross-references on upstream issues. Reviewers can participate here without
 being asked to act on an unconfirmed draft upstream.
 
+## Labels
+
+Labels are listed alphabetically, so each group has its own prefix:
+
+- `upstream/<area>` mirrors the LLVM issue's category label:
+  `upstream/frontend`, `upstream/format`, `upstream/CSA`, `upstream/tidy`,
+  `upstream/diagnostic`.
+- `approved` means at least two distinct reviewers commented `approve`.
+- `commented` means the reviewer has commented on the upstream LLVM issue.
+- `pre-sent` and `suspend` record review state.
+
+`category` labels are synced by `.github/workflows/sync-upstream-labels.yml`,
+`approved` and `commented` by their own workflows, and labels are never removed
+automatically.
+
 ## Review checklist
 
 - Does the source match the original report, including relevant conditions?
