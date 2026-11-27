@@ -1,0 +1,103 @@
+name: Rename category labels to the upstream prefix
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/rename-upstream-labels.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  rename:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          retries: 3
+          script: |
+            const RENAMES = {
+              frontend: "upstream/frontend",
+              format: "upstream/format",
+              CSA: "upstream/CSA",
+              tidy: "upstream/tidy",
+              diagnostic: "upstream/diagnostic"
+            };
+
+            const DESCRIPTIONS = {
+              "upstream/frontend": "Upstream label clang:frontend",
+              "upstream/format": "Upstream label clang-format",
+              "upstream/CSA": "Upstream label clang:static analyzer",
+              "upstream/tidy": "Upstream label clang-tidy",
+              "upstream/diagnostic": "Upstream label clang:diagnostics"
+            };
+
+            const { owner, repo } = context.repo;
+
+            async function labelExists(name) {
+              try {
+                await github.rest.issues.getLabel({ owner, repo, name });
+                return true;
+              } catch (error) {
+                if (error.status === 404) return false;
+                throw error;
+              }
+            }
+
+            for (const [oldName, newName] of Object.entries(RENAMES)) {
+              const oldExists = await labelExists(oldName);
+              const newExists = await labelExists(newName);
+
+              if (!oldExists) {
+                core.info(`${oldName}: absent, nothing to rename.`);
+                continue;
+              }
+
+              if (!newExists) {
+                // Renaming keeps the label on every issue that already has it.
+                await github.rest.issues.updateLabel({
+                  owner,
+                  repo,
+                  current_name: oldName,
+                  name: newName,
+                  description: DESCRIPTIONS[newName]
+                });
+                core.info(`${oldName} -> ${newName}.`);
+                continue;
+              }
+
+              // Both exist: move the issues over, then drop the old label.
+              const issues = await github.paginate(
+                github.rest.issues.listForRepo,
+                {
+                  owner,
+                  repo,
+                  labels: oldName,
+                  state: "all",
+                  per_page: 100
+                }
+              );
+
+              for (const issue of issues) {
+                await github.rest.issues.addLabels({
+                  owner,
+                  repo,
+                  issue_number: issue.number,
+                  labels: [newName]
+                });
+              }
+
+              await github.rest.issues.deleteLabel({
+                owner,
+                repo,
+                name: oldName
+              });
+
+              core.info(
+                `${oldName}: merged into ${newName} ` +
+                `(${issues.length} issue(s)).`
+              );
+            }
